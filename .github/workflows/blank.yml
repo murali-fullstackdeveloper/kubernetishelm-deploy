@@ -1,4 +1,4 @@
-name: AWS EKS CI/CD Pipeline
+name: AWS EKS CD Pipeline
 on:
   push:
     branches: [ main, develop ]
@@ -9,6 +9,8 @@ on:
 env:
   AWS_REGION: us-east-1  # Change to your AWS region
   EKS_CLUSTER: my-amazon-eks-cluster  # Update with your cluster name
+  # You can switch between DockerHub and ECR by changing this value
+  USE_ECR: "true"  # Set to "false" to use DockerHub instead
 
 jobs:
   build-push-deploy:
@@ -18,109 +20,146 @@ jobs:
       id-token: write
       contents: read
     steps:
-      # Checkout code
+      # STEP 1: BUILD
       - name: Checkout code
         uses: actions/checkout@v3
-
-      # Set up Docker Buildx for efficient builds
+      
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v2
-
-      # Generate image tag based on commit hash
+      
       - name: Generate image tag
         id: generate-tag
         run: |
           TAG=$(git rev-parse --short HEAD)
           echo "IMAGE_TAG=$TAG" >> $GITHUB_ENV
           echo "Using image tag: $TAG"
-
-      # Configure AWS credentials
-      - name: Configure AWS credentials
+      
+      # STEP 2: PUSH TO REGISTRY (ECR OR DOCKERHUB)
+      # For ECR
+      - name: Configure AWS credentials (for ECR)
+        if: env.USE_ECR == 'true'
         uses: aws-actions/configure-aws-credentials@v2
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
-          
-      # Optional: Configure for EKS IAM authentication
-      - name: Configure AWS IAM Role for EKS
-        if: ${{ secrets.AWS_EKS_ROLE_ARN != '' }}
-        run: |
-          echo "Setting up IAM role for EKS authentication"
-          echo "[profile eks]" > ~/.aws/config
-          echo "role_arn = ${{ secrets.AWS_EKS_ROLE_ARN }}" >> ~/.aws/config
-          echo "source_profile = default" >> ~/.aws/config
-
-      # Login to Amazon ECR
+      
       - name: Login to Amazon ECR
+        if: env.USE_ECR == 'true'
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v1
 
-      # Extract ECR registry URL
       - name: Set ECR registry as environment variable
-        run: echo "ECR_REGISTRY=${{ steps.login-ecr.outputs.registry }}" >> $GITHUB_ENV
+        if: env.USE_ECR == 'true'
+        run: echo "REGISTRY=${{ steps.login-ecr.outputs.registry }}" >> $GITHUB_ENV
 
-      # Create ECR repositories if they don't exist
       - name: Create ECR repositories if needed
+        if: env.USE_ECR == 'true'
         run: |
           aws ecr describe-repositories --repository-names frontend --region ${{ env.AWS_REGION }} || aws ecr create-repository --repository-name frontend --region ${{ env.AWS_REGION }}
           aws ecr describe-repositories --repository-names backend --region ${{ env.AWS_REGION }} || aws ecr create-repository --repository-name backend --region ${{ env.AWS_REGION }}
-
-      # Build and push frontend image to ECR
+      
+      # For DockerHub
+      - name: Login to DockerHub
+        if: env.USE_ECR == 'false'
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+      
+      - name: Set DockerHub registry as environment variable
+        if: env.USE_ECR == 'false'
+        run: echo "REGISTRY=${{ secrets.DOCKER_USERNAME }}" >> $GITHUB_ENV
+      
+      # Build and push frontend image
       - name: Build and push frontend image
         uses: docker/build-push-action@v4
         with:
           context: ./frontend
           push: true
           tags: |
-            ${{ env.ECR_REGISTRY }}/frontend:${{ env.IMAGE_TAG }}
-            ${{ env.ECR_REGISTRY }}/frontend:latest
+            ${{ env.REGISTRY }}/${{ env.USE_ECR == 'true' && '' || 'frontend:' }}${{ env.IMAGE_TAG }}
+            ${{ env.REGISTRY }}/${{ env.USE_ECR == 'true' && '' || 'frontend:' }}latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
-
-      # Build and push backend image to ECR
+      
+      # Build and push backend image
       - name: Build and push backend image
         uses: docker/build-push-action@v4
         with:
           context: ./backend
           push: true
           tags: |
-            ${{ env.ECR_REGISTRY }}/backend:${{ env.IMAGE_TAG }}
-            ${{ env.ECR_REGISTRY }}/backend:latest
+            ${{ env.REGISTRY }}/${{ env.USE_ECR == 'true' && '' || 'backend:' }}${{ env.IMAGE_TAG }}
+            ${{ env.REGISTRY }}/${{ env.USE_ECR == 'true' && '' || 'backend:' }}latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
-
-      # Update kubeconfig to connect to EKS cluster
+      
+      # STEP 3: CD (CONTINUOUS DEPLOYMENT)
+      # STEP 4: CONNECT TO KUBERNETES
+      - name: Configure AWS credentials (for EKS)
+        if: env.USE_ECR == 'true'
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      
       - name: Update kubeconfig for EKS
         run: |
           aws eks update-kubeconfig --name ${EKS_CLUSTER:-${{ secrets.EKS_CLUSTER_NAME }}} --region ${{ env.AWS_REGION }}
-
-      # Set up Helm
-      - name: Set up Helm
-        uses: azure/setup-helm@v3
-        with:
-          version: 'latest'
-
-      # Set up Kubectl
+      
       - name: Set up Kubectl
         uses: azure/setup-kubectl@v3
         with:
           version: 'latest'
-
-      # Update Helm values with new image tags
-      - name: Update Helm values with new image tags
+      
+      # STEP 5: CLONE HELM REPOSITORY
+      - name: Clone Helm repository
         run: |
+          if [ -n "${{ secrets.HELM_REPO_URL }}" ]; then
+            echo "Cloning Helm charts from repository"
+            git clone ${{ secrets.HELM_REPO_URL }} helm-repo
+            CHART_PATH="helm-repo"
+          elif [ -d "./helm" ]; then
+            echo "Using local Helm charts from ./helm"
+            CHART_PATH="./helm"
+          elif [ -d "./charts" ]; then
+            echo "Using local Helm charts from ./charts"
+            CHART_PATH="./charts"
+          else
+            echo "Error: Helm chart directory not found"
+            exit 1
+          fi
+          echo "CHART_PATH=$CHART_PATH" >> $GITHUB_ENV
+      
+      - name: Set up Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: 'latest'
+      
+      # Create values override file
+      - name: Create values override file
+        run: |
+          # Determine repository format based on whether using ECR or DockerHub
+          if [ "${{ env.USE_ECR }}" == "true" ]; then
+            FRONTEND_REPO="${{ env.REGISTRY }}/frontend"
+            BACKEND_REPO="${{ env.REGISTRY }}/backend"
+          else
+            FRONTEND_REPO="${{ env.REGISTRY }}/frontend"
+            BACKEND_REPO="${{ env.REGISTRY }}/backend"
+          fi
+          
           # Generate temporary values file with updated images
           cat > updated-values.yaml << EOF
           # Images configuration for frontend and backend
           frontend:
             image:
-              repository: ${{ env.ECR_REGISTRY }}/frontend
+              repository: ${FRONTEND_REPO}
               tag: "${{ env.IMAGE_TAG }}"
               pullPolicy: Always
           
           backend:
             image:
-              repository: ${{ env.ECR_REGISTRY }}/backend
+              repository: ${BACKEND_REPO}
               tag: "${{ env.IMAGE_TAG }}"
               pullPolicy: Always
               
@@ -131,11 +170,11 @@ jobs:
           # Additional configuration
           global:
             environment: ${GITHUB_REF##*/}
-            imageRegistry: ${{ env.ECR_REGISTRY }}
+            imageRegistry: ${{ env.REGISTRY }}
           EOF
-
-      # Deploy with Helm
-      - name: Deploy with Helm
+      
+      # STEP 6: INSTALL/UPGRADE
+      - name: Install or upgrade with Helm
         run: |
           # Create namespace if it doesn't exist
           NAMESPACE="${{ secrets.K8S_NAMESPACE || 'default' }}"
@@ -144,24 +183,14 @@ jobs:
           # Install or upgrade using Helm
           RELEASE_NAME="${{ secrets.HELM_RELEASE_NAME || 'myapp' }}"
           
-          # Check if helm chart exists
-          if [ -d "./helm" ]; then
-            CHART_PATH="./helm"
-          elif [ -d "./charts" ]; then
-            CHART_PATH="./charts"
-          else
-            echo "Error: Helm chart directory not found"
-            exit 1
-          fi
-          
-          helm upgrade --install $RELEASE_NAME $CHART_PATH \
+          helm upgrade --install $RELEASE_NAME ${{ env.CHART_PATH }} \
             --namespace $NAMESPACE \
-            --values $CHART_PATH/values.yaml \
+            --values ${{ env.CHART_PATH }}/values.yaml \
             --values ./updated-values.yaml \
             --set global.environment=${GITHUB_REF##*/} \
             --wait --timeout 5m
-
-      # Verify deployment
+      
+      # STEP 7: EXECUTE KUBERNETES COMMANDS
       - name: Verify deployment
         run: |
           NAMESPACE="${{ secrets.K8S_NAMESPACE || 'default' }}"
@@ -174,8 +203,7 @@ jobs:
           kubectl rollout status deployment/$RELEASE_NAME-backend -n $NAMESPACE --timeout=120s
           
           echo "Deployment verification completed successfully"
-
-      # Run health checks
+      
       - name: Run application health checks
         run: |
           NAMESPACE="${{ secrets.K8S_NAMESPACE || 'default' }}"
@@ -188,7 +216,7 @@ jobs:
           echo "Waiting for backend service..."
           kubectl get svc $RELEASE_NAME-backend -n $NAMESPACE
           
-          # Get ELB/ALB URLs if service type is LoadBalancer
+          # Get LoadBalancer URLs if service type is LoadBalancer
           echo "Checking for LoadBalancer endpoints..."
           FRONTEND_LB=$(kubectl get svc $RELEASE_NAME-frontend -n $NAMESPACE -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
           if [ -n "$FRONTEND_LB" ]; then
@@ -200,7 +228,8 @@ jobs:
             echo "Backend LoadBalancer: $BACKEND_LB"
           fi
           
-          # Add custom health checks if needed
+          # Execute any custom post-deployment commands
           if [ -n "${{ secrets.POST_DEPLOY_COMMAND }}" ]; then
+            echo "Running custom post-deployment commands..."
             eval "${{ secrets.POST_DEPLOY_COMMAND }}"
           fi
