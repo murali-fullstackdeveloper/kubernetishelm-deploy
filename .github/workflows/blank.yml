@@ -8,6 +8,7 @@ on:
 
 env:
   AWS_REGION: us-east-1  # Change to your AWS region
+  EKS_CLUSTER: my-amazon-eks-cluster  # Update with your cluster name
 
 jobs:
   build-push-deploy:
@@ -39,6 +40,15 @@ jobs:
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
+          
+      # Optional: Configure for EKS IAM authentication
+      - name: Configure AWS IAM Role for EKS
+        if: ${{ secrets.AWS_EKS_ROLE_ARN != '' }}
+        run: |
+          echo "Setting up IAM role for EKS authentication"
+          echo "[profile eks]" > ~/.aws/config
+          echo "role_arn = ${{ secrets.AWS_EKS_ROLE_ARN }}" >> ~/.aws/config
+          echo "source_profile = default" >> ~/.aws/config
 
       # Login to Amazon ECR
       - name: Login to Amazon ECR
@@ -82,7 +92,7 @@ jobs:
       # Update kubeconfig to connect to EKS cluster
       - name: Update kubeconfig for EKS
         run: |
-          aws eks update-kubeconfig --name ${{ secrets.EKS_CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
+          aws eks update-kubeconfig --name ${EKS_CLUSTER:-${{ secrets.EKS_CLUSTER_NAME }}} --region ${{ env.AWS_REGION }}
 
       # Set up Helm
       - name: Set up Helm
@@ -101,6 +111,7 @@ jobs:
         run: |
           # Generate temporary values file with updated images
           cat > updated-values.yaml << EOF
+          # Images configuration for frontend and backend
           frontend:
             image:
               repository: ${{ env.ECR_REGISTRY }}/frontend
@@ -112,6 +123,15 @@ jobs:
               repository: ${{ env.ECR_REGISTRY }}/backend
               tag: "${{ env.IMAGE_TAG }}"
               pullPolicy: Always
+              
+          # AWS-specific settings
+          aws:
+            region: ${{ env.AWS_REGION }}
+            
+          # Additional configuration
+          global:
+            environment: ${GITHUB_REF##*/}
+            imageRegistry: ${{ env.ECR_REGISTRY }}
           EOF
 
       # Deploy with Helm
@@ -123,10 +143,22 @@ jobs:
           
           # Install or upgrade using Helm
           RELEASE_NAME="${{ secrets.HELM_RELEASE_NAME || 'myapp' }}"
-          helm upgrade --install $RELEASE_NAME ./helm \
+          
+          # Check if helm chart exists
+          if [ -d "./helm" ]; then
+            CHART_PATH="./helm"
+          elif [ -d "./charts" ]; then
+            CHART_PATH="./charts"
+          else
+            echo "Error: Helm chart directory not found"
+            exit 1
+          fi
+          
+          helm upgrade --install $RELEASE_NAME $CHART_PATH \
             --namespace $NAMESPACE \
-            --values ./helm/values.yaml \
+            --values $CHART_PATH/values.yaml \
             --values ./updated-values.yaml \
+            --set global.environment=${GITHUB_REF##*/} \
             --wait --timeout 5m
 
       # Verify deployment
@@ -155,6 +187,18 @@ jobs:
           
           echo "Waiting for backend service..."
           kubectl get svc $RELEASE_NAME-backend -n $NAMESPACE
+          
+          # Get ELB/ALB URLs if service type is LoadBalancer
+          echo "Checking for LoadBalancer endpoints..."
+          FRONTEND_LB=$(kubectl get svc $RELEASE_NAME-frontend -n $NAMESPACE -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+          if [ -n "$FRONTEND_LB" ]; then
+            echo "Frontend LoadBalancer: $FRONTEND_LB"
+          fi
+          
+          BACKEND_LB=$(kubectl get svc $RELEASE_NAME-backend -n $NAMESPACE -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+          if [ -n "$BACKEND_LB" ]; then
+            echo "Backend LoadBalancer: $BACKEND_LB"
+          fi
           
           # Add custom health checks if needed
           if [ -n "${{ secrets.POST_DEPLOY_COMMAND }}" ]; then
