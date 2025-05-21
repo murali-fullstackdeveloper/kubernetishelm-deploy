@@ -1,0 +1,162 @@
+name: AWS EKS CI/CD Pipeline
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1  # Change to your AWS region
+
+jobs:
+  build-push-deploy:
+    name: Build, Push and Deploy to EKS
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      # Checkout code
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      # Set up Docker Buildx for efficient builds
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      # Generate image tag based on commit hash
+      - name: Generate image tag
+        id: generate-tag
+        run: |
+          TAG=$(git rev-parse --short HEAD)
+          echo "IMAGE_TAG=$TAG" >> $GITHUB_ENV
+          echo "Using image tag: $TAG"
+
+      # Configure AWS credentials
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Login to Amazon ECR
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      # Extract ECR registry URL
+      - name: Set ECR registry as environment variable
+        run: echo "ECR_REGISTRY=${{ steps.login-ecr.outputs.registry }}" >> $GITHUB_ENV
+
+      # Create ECR repositories if they don't exist
+      - name: Create ECR repositories if needed
+        run: |
+          aws ecr describe-repositories --repository-names frontend --region ${{ env.AWS_REGION }} || aws ecr create-repository --repository-name frontend --region ${{ env.AWS_REGION }}
+          aws ecr describe-repositories --repository-names backend --region ${{ env.AWS_REGION }} || aws ecr create-repository --repository-name backend --region ${{ env.AWS_REGION }}
+
+      # Build and push frontend image to ECR
+      - name: Build and push frontend image
+        uses: docker/build-push-action@v4
+        with:
+          context: ./frontend
+          push: true
+          tags: |
+            ${{ env.ECR_REGISTRY }}/frontend:${{ env.IMAGE_TAG }}
+            ${{ env.ECR_REGISTRY }}/frontend:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Build and push backend image to ECR
+      - name: Build and push backend image
+        uses: docker/build-push-action@v4
+        with:
+          context: ./backend
+          push: true
+          tags: |
+            ${{ env.ECR_REGISTRY }}/backend:${{ env.IMAGE_TAG }}
+            ${{ env.ECR_REGISTRY }}/backend:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Update kubeconfig to connect to EKS cluster
+      - name: Update kubeconfig for EKS
+        run: |
+          aws eks update-kubeconfig --name ${{ secrets.EKS_CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
+
+      # Set up Helm
+      - name: Set up Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: 'latest'
+
+      # Set up Kubectl
+      - name: Set up Kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'latest'
+
+      # Update Helm values with new image tags
+      - name: Update Helm values with new image tags
+        run: |
+          # Generate temporary values file with updated images
+          cat > updated-values.yaml << EOF
+          frontend:
+            image:
+              repository: ${{ env.ECR_REGISTRY }}/frontend
+              tag: "${{ env.IMAGE_TAG }}"
+              pullPolicy: Always
+          
+          backend:
+            image:
+              repository: ${{ env.ECR_REGISTRY }}/backend
+              tag: "${{ env.IMAGE_TAG }}"
+              pullPolicy: Always
+          EOF
+
+      # Deploy with Helm
+      - name: Deploy with Helm
+        run: |
+          # Create namespace if it doesn't exist
+          NAMESPACE="${{ secrets.K8S_NAMESPACE || 'default' }}"
+          kubectl create namespace $NAMESPACE --dry-run=client -o yaml | kubectl apply -f -
+          
+          # Install or upgrade using Helm
+          RELEASE_NAME="${{ secrets.HELM_RELEASE_NAME || 'myapp' }}"
+          helm upgrade --install $RELEASE_NAME ./helm \
+            --namespace $NAMESPACE \
+            --values ./helm/values.yaml \
+            --values ./updated-values.yaml \
+            --wait --timeout 5m
+
+      # Verify deployment
+      - name: Verify deployment
+        run: |
+          NAMESPACE="${{ secrets.K8S_NAMESPACE || 'default' }}"
+          RELEASE_NAME="${{ secrets.HELM_RELEASE_NAME || 'myapp' }}"
+          
+          echo "Checking frontend deployment status..."
+          kubectl rollout status deployment/$RELEASE_NAME-frontend -n $NAMESPACE --timeout=120s
+          
+          echo "Checking backend deployment status..."
+          kubectl rollout status deployment/$RELEASE_NAME-backend -n $NAMESPACE --timeout=120s
+          
+          echo "Deployment verification completed successfully"
+
+      # Run health checks
+      - name: Run application health checks
+        run: |
+          NAMESPACE="${{ secrets.K8S_NAMESPACE || 'default' }}"
+          RELEASE_NAME="${{ secrets.HELM_RELEASE_NAME || 'myapp' }}"
+          
+          # Wait for services to be ready
+          echo "Waiting for frontend service..."
+          kubectl get svc $RELEASE_NAME-frontend -n $NAMESPACE
+          
+          echo "Waiting for backend service..."
+          kubectl get svc $RELEASE_NAME-backend -n $NAMESPACE
+          
+          # Add custom health checks if needed
+          if [ -n "${{ secrets.POST_DEPLOY_COMMAND }}" ]; then
+            eval "${{ secrets.POST_DEPLOY_COMMAND }}"
+          fi
