@@ -1,0 +1,27 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-frontend
+  labels:
+    {{- include "crud-app.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.frontend.replicas }}
+  selector:
+    matchLabels:
+      app: {{ .Release.Name }}-frontend
+  template:
+    metadata:
+      labels:
+        app: {{ .Release.Name }}-frontend
+        {{- include "crud-app.labels" . | nindent 8 }}
+    spec:
+      containers:
+      - name: frontend
+        image: {{ .Values.frontend.image }}
+        env:
+        - name: REACT_APP_API_URL
+          value: "http://{{ .Values.backend.service.name }}:{{ .Values.backend.port }}"
+        ports:
+        - containerPort: {{ .Values.frontend.port }}
+        resources:
+          {{- toYaml .Values.frontend.resources | nindent 10 }}

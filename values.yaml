@@ -1,0 +1,35 @@
+# Application configuration
+
+backend:
+  image: "murali325/crud-backend"
+  replicas: 1
+  port: 5000
+  service:
+    name: "crud-backend-service"
+    type: "LoadBalancer"
+  resources:
+    limits:
+      cpu: "500m"
+      memory: "512Mi"
+    requests:
+      cpu: "200m"
+      memory: "256Mi"
+
+frontend:
+  image: "murali325/crud-frontend"
+  replicas: 1
+  port: 80
+  service:
+    name: "crud-frontend-service"
+    type: "LoadBalancer"
+  resources:
+    limits:
+      cpu: "500m"
+      memory: "512Mi"
+    requests:
+      cpu: "200m"
+      memory: "256Mi"
+
+# MongoDB configuration
+mongodb:
+  url: "mongodb+srv://muraliashogan2012:muraliashogan2012@cluster0.sfgmoaf.mongodb.net/?retryWrites=true&w=majority&appName=Cluster"
